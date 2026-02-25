@@ -85,14 +85,44 @@ def _today_log_path() -> str:
 
 def write_daily_log(keer_product_id: str, result: str, detail: str = ""):
     """
-    向当天日志文件追加一条记录
+    向当天日志文件追加一条记录，并同步写入数据库
     result: 'success' / 'failed' / 'skipped'
     """
+    # 写本地文件（原有逻辑保留）
     log_path = _today_log_path()
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{now_str}] [{result.upper():8s}] ID={keer_product_id or '-':30s} {detail}\n"
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(line)
+
+    # 同步写入数据库
+    _write_db_log(keer_product_id, result, detail)
+
+
+def _write_db_log(keer_product_id: str, result: str, detail: str = ""):
+    """将任务执行结果写入 shopify_task_log 表"""
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        try:
+            with conn.cursor() as cursor:
+                sql = """
+                    INSERT INTO shopify_task_log
+                        (task_date, keer_product_id, result, detail, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                """
+                now = datetime.now()
+                cursor.execute(sql, (
+                    now.strftime('%Y-%m-%d'),
+                    keer_product_id or '',
+                    result,
+                    detail[:500] if detail else '',
+                    now.strftime('%Y-%m-%d %H:%M:%S')
+                ))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        log_error(f"DB日志写入失败（不影响主流程）: {e}")
 
 def write_daily_summary():
     """
@@ -938,6 +968,19 @@ def main_loop():
         if remaining > 0:
             log_info(f"⏱️ 本次耗时 {elapsed:.1f}s，等待 {remaining:.1f}s 后处理下一个...")
             time.sleep(remaining)
+
+
+# ============================================================
+# 影刀 RPA 入口（供影刀直接调用）
+# ============================================================
+
+def shopify_run(args=None):
+    """
+    影刀 RPA 统一入口函数。
+    在影刀中配置「执行Python函数」，函数名填 shopify_run，即可全自动运行。
+    args 参数由影刀平台传入，可忽略。
+    """
+    main_loop()
 
 
 # ============================================================
