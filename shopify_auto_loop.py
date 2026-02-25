@@ -92,7 +92,7 @@ def write_daily_log(keer_product_id: str, result: str, detail: str = ""):
     # 写本地文件（原有逻辑保留）
     log_path = _today_log_path()
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    line = f"[{now_str}] [{result.upper():8s}] ID={keer_product_id or '-':30s} {detail}\n"
+    line = f"[{now_str}] [{result.upper():8s}] ID={str(keer_product_id or '-'):30s} {detail}\n"
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(line)
 
