@@ -970,12 +970,14 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
     log_info(f"--- 开始处理任务: {keer_product_id} ---")
     log_info(f"商品URL: {client_product_url}")
 
-    # 2. 解析价格
+    # 2. 解析价格（原始为欧元，×1.2 转为美元）
     price = parse_price_from_quotation(quotation_result)
     if price is None:
         log_warning("价格解析失败，使用默认价格 0.0")
         price = 0.0
-    log_info(f"解析价格: ${price}")
+    price_eur = price
+    price = round(price * 1.2, 2)
+    log_info(f"解析价格: €{price_eur} → ${price}（×1.2 EUR→USD）")
 
     # 3. 抓取商品
     scraper = ShopifyScraper()
