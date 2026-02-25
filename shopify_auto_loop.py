@@ -14,6 +14,7 @@ import threading
 import uuid
 import requests
 import pymysql
+from playwright.sync_api import sync_playwright
 
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -44,7 +45,7 @@ DB_CONFIG = {
 
 # API基础地址
 API_BASE_URL     = "http://47.95.157.46:8520"
-LOG_API_BASE_URL = "http://47.95.157.46:5002"   # 日志 & Cookie 状态 API
+LOG_API_BASE_URL = "http://47.95.157.46"         # 日志 & Cookie 状态 API（nginx 80端口反代）
 
 # Shopify配置
 STORE_ID = "893848-2"
@@ -710,39 +711,68 @@ def download_cookies() -> Optional[list]:
 # Shopify CSV上传
 # ============================================================
 
-def _get_csrf_token(session: requests.Session) -> Optional[str]:
-    """从Shopify后台页面获取CSRF Token"""
+def _get_csrf_token_playwright(cookie_list: list) -> Optional[str]:
+    """
+    使用 Playwright（真实 Chromium）获取 CSRF Token。
+    requests 直接访问会被 Shopify Bot 检测返回 403；
+    Playwright 携带完整浏览器指纹，可绕过检测。
+    """
     url = f"https://admin.shopify.com/store/{STORE_ID}/products?selectedView=all"
-    headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'zh-CN,zh;q=0.9',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                      '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-        'upgrade-insecure-requests': '1',
-    }
     try:
-        response = session.get(url, headers=headers, timeout=30)
-        if response.status_code != 200:
-            log_error(f"获取CSRF页面失败: {response.status_code}")
-            report_cookie_status(False, f"CSRF页面返回 HTTP {response.status_code}，Cookie可能已失效")
-            return None
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                           '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+                locale='zh-CN',
+            )
+
+            # 将下载的 cookie 注入浏览器
+            pw_cookies = []
+            for c in cookie_list:
+                entry = {
+                    'name':   c['name'],
+                    'value':  c['value'],
+                    'domain': c.get('domain', '.shopify.com'),
+                    'path':   c.get('path', '/'),
+                }
+                if 'expires' in c and c['expires']:
+                    entry['expires'] = float(c['expires'])
+                if 'httpOnly' in c:
+                    entry['httpOnly'] = bool(c['httpOnly'])
+                if 'secure' in c:
+                    entry['secure'] = bool(c['secure'])
+                pw_cookies.append(entry)
+            context.add_cookies(pw_cookies)
+
+            page = context.new_page()
+            log_info("🌐 Playwright 正在加载 Shopify 后台...")
+            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+
+            content = page.content()
+            browser.close()
+
         pattern = r'<script type="text/json" data-serialized-id="server-data">\s*(\{.*?\})\s*</script>'
-        match = re.search(pattern, response.text, re.DOTALL)
+        match = re.search(pattern, content, re.DOTALL)
         if not match:
-            log_error("未找到server-data，无法获取CSRF token")
-            report_cookie_status(False, "未找到server-data，Cookie可能已失效或被重定向至登录页")
+            log_error("未找到 server-data，Cookie 可能已失效或被重定向至登录页")
+            report_cookie_status(False, "Playwright 未找到 server-data，Cookie 可能已失效")
             return None
+
         server_data = json.loads(match.group(1))
         token = server_data.get('csrfToken')
         if token:
-            log_info(f"✅ 获取CSRF token成功: {token[:30]}...")
-            report_cookie_status(True, "CSRF token获取成功，Cookie有效")
+            log_info(f"✅ Playwright 获取 CSRF token 成功: {token[:30]}...")
+            report_cookie_status(True, "Playwright CSRF token 获取成功，Cookie 有效")
             return token
-        log_error("server-data中无csrfToken字段")
-        report_cookie_status(False, "server-data中无csrfToken字段，Cookie可能已失效")
+
+        log_error("server-data 中无 csrfToken 字段")
+        report_cookie_status(False, "server-data 中无 csrfToken 字段，Cookie 可能已失效")
         return None
+
     except Exception as e:
-        log_error(f"获取CSRF token异常: {e}")
+        log_error(f"Playwright 获取 CSRF token 异常: {e}")
+        report_cookie_status(False, f"Playwright 异常: {str(e)[:200]}")
         return None
 
 
@@ -787,8 +817,8 @@ def _do_upload(csv_file: str) -> bool:
     filename  = file_path.name
     log_info(f"文件: {filename}，大小: {file_size} bytes")
 
-    # 3. 获取CSRF Token
-    csrf_token = _get_csrf_token(session)
+    # 3. 获取CSRF Token（Playwright 真实浏览器，绕过 Shopify Bot 检测）
+    csrf_token = _get_csrf_token_playwright(cookie_list)
     if not csrf_token:
         return False
 
