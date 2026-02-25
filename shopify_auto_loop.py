@@ -648,11 +648,8 @@ def generate_shopify_csv(product: ProductDetail, price: float, category: str,
 # Cookie 状态上报
 # ============================================================
 
-def report_cookie_status(is_valid: bool, detail: str = ""):
-    """
-    向 API 服务上报当前 Cookie 有效性。
-    失败时静默处理，不影响主流程。
-    """
+def _report_cookie_status_worker(is_valid: bool, detail: str):
+    """后台线程：执行上报，失败静默处理"""
     try:
         url = f"{LOG_API_BASE_URL}/api/shopify/cookie-status/report"
         payload = {
@@ -661,44 +658,49 @@ def report_cookie_status(is_valid: bool, detail: str = ""):
             "checker":  "auto_loop",
             "detail":   detail[:500] if detail else "",
         }
-        resp = requests.post(url, json=payload, timeout=5)
+        resp = requests.post(url, json=payload, timeout=2)
         if resp.status_code == 200:
             status_str = "有效" if is_valid else "失效"
-            log_info(f"🍪 Cookie状态已上报: {status_str} | {detail}")
+            log_info(f"Cookie状态已上报: {status_str} | {detail}")
         else:
             log_warning(f"Cookie状态上报失败: HTTP {resp.status_code}")
     except Exception as e:
         log_warning(f"Cookie状态上报异常（不影响主流程）: {e}")
 
 
+def report_cookie_status(is_valid: bool, detail: str = ""):
+    """
+    向 API 服务上报当前 Cookie 有效性。
+    后台线程发送，不阻塞主流程。
+    """
+    t = threading.Thread(target=_report_cookie_status_worker, args=(is_valid, detail), daemon=True)
+    t.start()
+
+
 # ============================================================
 # Cookie下载（从腾讯云COS）
 # ============================================================
 
-def download_cookies() -> Optional[dict]:
-    """从COS下载Cookie JSON，返回cookies字典"""
+def download_cookies() -> Optional[list]:
+    """从COS下载Cookie JSON，返回完整cookie列表（含domain/path信息）"""
     try:
         log_info(f"正在下载Cookie: {COOKIE_URL}")
         resp = requests.get(COOKIE_URL, timeout=15)
         resp.raise_for_status()
         data = resp.json()
 
-        cookies = {}
+        cookie_list = []
         if isinstance(data, dict) and 'cookies' in data:
             for c in data['cookies']:
                 if 'name' in c and 'value' in c:
-                    cookies[c['name']] = c['value']
+                    cookie_list.append(c)
         elif isinstance(data, list):
             for c in data:
                 if 'name' in c and 'value' in c:
-                    cookies[c['name']] = c['value']
-        elif isinstance(data, dict):
-            for k, v in data.items():
-                if k not in ['url', 'local_storage']:
-                    cookies[k] = v
+                    cookie_list.append(c)
 
-        log_info(f"✅ Cookie加载成功，共 {len(cookies)} 个")
-        return cookies
+        log_info(f"✅ Cookie加载成功，共 {len(cookie_list)} 个")
+        return cookie_list
     except Exception as e:
         log_error(f"❌ Cookie下载失败: {e}")
         return None
@@ -761,16 +763,23 @@ def upload_csv_to_shopify(csv_file: str) -> bool:
 def _do_upload(csv_file: str) -> bool:
     """执行一次上传"""
     # 1. 下载Cookie
-    cookies = download_cookies()
-    if not cookies:
+    cookie_list = download_cookies()
+    if not cookie_list:
         return False
 
-    session = requests.Session()
-    for name, value in cookies.items():
-        session.cookies.set(name, value)
+    from requests.cookies import RequestsCookieJar
+    jar = RequestsCookieJar()
+    for c in cookie_list:
+        domain = c.get('domain', '')
+        path   = c.get('path', '/')
+        jar.set(c['name'], c['value'], domain=domain, path=path)
 
-    session_token    = cookies.get('_shopify_s', '')
-    multitrack_token = cookies.get('_shopify_y', '')
+    session = requests.Session()
+    session.cookies = jar
+
+    cookies_dict     = {c['name']: c['value'] for c in cookie_list}
+    session_token    = cookies_dict.get('_shopify_s', '')
+    multitrack_token = cookies_dict.get('_shopify_y', '')
 
     # 2. 获取文件信息
     file_path = Path(csv_file)
