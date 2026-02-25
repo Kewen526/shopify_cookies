@@ -43,7 +43,8 @@ DB_CONFIG = {
 }
 
 # API基础地址
-API_BASE_URL = "http://47.95.157.46:8520"
+API_BASE_URL     = "http://47.95.157.46:8520"
+LOG_API_BASE_URL = "http://47.95.157.46:5002"   # 日志 & Cookie 状态 API
 
 # Shopify配置
 STORE_ID = "893848-2"
@@ -644,6 +645,33 @@ def generate_shopify_csv(product: ProductDetail, price: float, category: str,
 
 
 # ============================================================
+# Cookie 状态上报
+# ============================================================
+
+def report_cookie_status(is_valid: bool, detail: str = ""):
+    """
+    向 API 服务上报当前 Cookie 有效性。
+    失败时静默处理，不影响主流程。
+    """
+    try:
+        url = f"{LOG_API_BASE_URL}/api/shopify/cookie-status/report"
+        payload = {
+            "store_id": STORE_ID,
+            "is_valid": is_valid,
+            "checker":  "auto_loop",
+            "detail":   detail[:500] if detail else "",
+        }
+        resp = requests.post(url, json=payload, timeout=5)
+        if resp.status_code == 200:
+            status_str = "有效" if is_valid else "失效"
+            log_info(f"🍪 Cookie状态已上报: {status_str} | {detail}")
+        else:
+            log_warning(f"Cookie状态上报失败: HTTP {resp.status_code}")
+    except Exception as e:
+        log_warning(f"Cookie状态上报异常（不影响主流程）: {e}")
+
+
+# ============================================================
 # Cookie下载（从腾讯云COS）
 # ============================================================
 
@@ -694,18 +722,22 @@ def _get_csrf_token(session: requests.Session) -> Optional[str]:
         response = session.get(url, headers=headers, timeout=30)
         if response.status_code != 200:
             log_error(f"获取CSRF页面失败: {response.status_code}")
+            report_cookie_status(False, f"CSRF页面返回 HTTP {response.status_code}，Cookie可能已失效")
             return None
         pattern = r'<script type="text/json" data-serialized-id="server-data">\s*(\{.*?\})\s*</script>'
         match = re.search(pattern, response.text, re.DOTALL)
         if not match:
             log_error("未找到server-data，无法获取CSRF token")
+            report_cookie_status(False, "未找到server-data，Cookie可能已失效或被重定向至登录页")
             return None
         server_data = json.loads(match.group(1))
         token = server_data.get('csrfToken')
         if token:
             log_info(f"✅ 获取CSRF token成功: {token[:30]}...")
+            report_cookie_status(True, "CSRF token获取成功，Cookie有效")
             return token
         log_error("server-data中无csrfToken字段")
+        report_cookie_status(False, "server-data中无csrfToken字段，Cookie可能已失效")
         return None
     except Exception as e:
         log_error(f"获取CSRF token异常: {e}")
