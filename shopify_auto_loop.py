@@ -14,7 +14,9 @@ import threading
 import uuid
 import requests
 import pymysql
-from playwright.sync_api import sync_playwright
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -711,59 +713,80 @@ def download_cookies() -> Optional[list]:
 # Shopify CSV上传
 # ============================================================
 
-def _get_csrf_token_playwright(cookie_list: list) -> Optional[str]:
+def _get_csrf_token_selenium(cookie_list: list) -> Optional[str]:
     """
-    使用 Playwright（真实 Chromium）获取 CSRF Token。
+    使用 Selenium（真实 Chrome）获取 CSRF Token。
     requests 直接访问会被 Shopify Bot 检测返回 403；
-    Playwright 携带完整浏览器指纹，可绕过检测。
+    Selenium 携带完整浏览器指纹，可绕过检测。
     """
     url = f"https://admin.shopify.com/store/{STORE_ID}/products?selectedView=all"
+    driver = None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                           '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-                locale='zh-CN',
-            )
+        chrome_options = ChromeOptions()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+        chrome_options.add_argument('--window-size=1280,800')
+        chrome_options.add_argument('--lang=zh-CN')
+        chrome_options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
+        )
+        # 隐藏自动化特征
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
 
-            # 将下载的 cookie 注入浏览器
-            pw_cookies = []
-            for c in cookie_list:
-                entry = {
-                    'name':   c['name'],
-                    'value':  c['value'],
-                    'domain': c.get('domain', '.shopify.com'),
-                    'path':   c.get('path', '/'),
-                }
-                if 'expires' in c and c['expires']:
-                    entry['expires'] = float(c['expires'])
-                if 'httpOnly' in c:
-                    entry['httpOnly'] = bool(c['httpOnly'])
-                if 'secure' in c:
-                    entry['secure'] = bool(c['secure'])
-                pw_cookies.append(entry)
-            context.add_cookies(pw_cookies)
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        })
 
-            page = context.new_page()
-            log_info("🌐 Playwright 正在加载 Shopify 后台...")
-            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+        # Selenium 注入 cookie 前必须先打开同域页面
+        log_info("🌐 Selenium 正在加载 Shopify 后台...")
+        driver.get("https://admin.shopify.com/")
+        time.sleep(1)
 
-            content = page.content()
-            browser.close()
+        # 注入 cookie
+        for c in cookie_list:
+            cookie_entry = {
+                'name':   c['name'],
+                'value':  c['value'],
+                'domain': c.get('domain', '.shopify.com'),
+                'path':   c.get('path', '/'),
+            }
+            if c.get('secure'):
+                cookie_entry['secure'] = True
+            if c.get('httpOnly'):
+                cookie_entry['httpOnly'] = True
+            try:
+                driver.add_cookie(cookie_entry)
+            except Exception:
+                pass  # 跳过个别不兼容的 cookie
+
+        # 访问目标页面
+        driver.get(url)
+        # 等待页面加载
+        time.sleep(5)
+
+        content = driver.page_source
 
         pattern = r'<script type="text/json" data-serialized-id="server-data">\s*(\{.*?\})\s*</script>'
         match = re.search(pattern, content, re.DOTALL)
         if not match:
-            log_error("未找到 server-data，Cookie 可能已失效或被重定向至登录页")
-            report_cookie_status(False, "Playwright 未找到 server-data，Cookie 可能已失效")
+            current_url = driver.current_url
+            log_error(f"未找到 server-data，当前URL: {current_url}")
+            if 'login' in current_url or 'accounts.shopify.com' in current_url:
+                report_cookie_status(False, "被重定向至登录页，Cookie 已失效")
+            else:
+                report_cookie_status(False, "Selenium 未找到 server-data，Cookie 可能已失效")
             return None
 
         server_data = json.loads(match.group(1))
         token = server_data.get('csrfToken')
         if token:
-            log_info(f"✅ Playwright 获取 CSRF token 成功: {token[:30]}...")
-            report_cookie_status(True, "Playwright CSRF token 获取成功，Cookie 有效")
+            log_info(f"✅ Selenium 获取 CSRF token 成功: {token[:30]}...")
+            report_cookie_status(True, "Selenium CSRF token 获取成功，Cookie 有效")
             return token
 
         log_error("server-data 中无 csrfToken 字段")
@@ -771,9 +794,15 @@ def _get_csrf_token_playwright(cookie_list: list) -> Optional[str]:
         return None
 
     except Exception as e:
-        log_error(f"Playwright 获取 CSRF token 异常: {e}")
-        report_cookie_status(False, f"Playwright 异常: {str(e)[:200]}")
+        log_error(f"Selenium 获取 CSRF token 异常: {e}")
+        report_cookie_status(False, f"Selenium 异常: {str(e)[:200]}")
         return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def upload_csv_to_shopify(csv_file: str) -> bool:
@@ -817,8 +846,8 @@ def _do_upload(csv_file: str) -> bool:
     filename  = file_path.name
     log_info(f"文件: {filename}，大小: {file_size} bytes")
 
-    # 3. 获取CSRF Token（Playwright 真实浏览器，绕过 Shopify Bot 检测）
-    csrf_token = _get_csrf_token_playwright(cookie_list)
+    # 3. 获取CSRF Token（Selenium 真实浏览器，绕过 Shopify Bot 检测）
+    csrf_token = _get_csrf_token_selenium(cookie_list)
     if not csrf_token:
         return False
 
