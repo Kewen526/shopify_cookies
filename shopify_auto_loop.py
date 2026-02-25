@@ -45,7 +45,7 @@ DB_CONFIG = {
 
 # API基础地址
 API_BASE_URL     = "http://47.95.157.46:8520"
-LOG_API_BASE_URL = "http://47.95.157.46"         # 日志 & Cookie 状态 API（nginx 80端口反代）
+LOG_API_BASE_URL = "http://47.95.157.46:5002"    # 日志 & Cookie 状态 API
 
 # Shopify配置
 STORE_ID = "893848-2"
