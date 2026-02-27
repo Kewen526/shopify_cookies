@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Shopify CSV 自动生成 + 上传（单任务测试版，供 PyCharm 本地调试使用）
-只获取并处理一条任务后退出。
+Shopify CSV 自动生成 + 上传
+支持单次测试 (process_one_task) 和无限循环模式 (run_forever)。
 """
 
 import csv
@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import traceback
 import threading
 import uuid
 import requests
@@ -1486,18 +1487,78 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
 # 程序入口（单任务测试模式）
 # ============================================================
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("🧪 Shopify 单任务测试模式（只处理一条任务后退出）")
-    print(f"   日志目录: {LOG_DIR}")
-    print("=" * 60)
+def run_forever(task_interval: int = 10, key_refresh_hours: int = 1):
+    """
+    无限循环运行 Shopify 自动上架任务。
+    24小时不间断从数据库拉取任务并处理。
 
+    参数:
+        task_interval:      每次任务之间的等待秒数（默认10秒）
+        key_refresh_hours:  ZhipuAI密钥刷新间隔（小时，默认1小时）
+    """
     _ensure_log_dir()
-    init_global_api_keys()
+
+    log_info("初始化 ZhipuAI 密钥...")
+    if not init_global_api_keys():
+        log_error("ZhipuAI 密钥初始化失败，60秒后重试...")
+        time.sleep(60)
+        if not init_global_api_keys():
+            log_error("ZhipuAI 密钥初始化二次失败，退出")
+            return
+
     analyzer = ZhipuImageAnalyzer()
 
-    result = process_one_task(analyzer)
-
-    print("\n" + "=" * 60)
-    print(f"🏁 执行结果: {result.upper()}")
     print("=" * 60)
+    print("🚀 Shopify 自动上架 — 无限循环模式已启动")
+    print(f"   任务间隔: {task_interval}秒")
+    print(f"   密钥刷新: 每{key_refresh_hours}小时")
+    print(f"   日志目录: {LOG_DIR}")
+    print("=" * 60)
+    log_info("无限循环模式已启动")
+
+    task_count = 0
+    success_count = 0
+    fail_count = 0
+    last_key_refresh = time.time()
+
+    while True:
+        try:
+            # 定时刷新 ZhipuAI 密钥
+            if time.time() - last_key_refresh > key_refresh_hours * 3600:
+                log_info("⏰ 定时刷新 ZhipuAI 密钥...")
+                if refresh_api_keys():
+                    log_info("✅ 密钥刷新成功")
+                else:
+                    log_warning("⚠️ 密钥刷新失败，继续使用旧密钥")
+                last_key_refresh = time.time()
+
+            # 处理一条任务
+            result = process_one_task(analyzer)
+
+            if result == 'success':
+                task_count += 1
+                success_count += 1
+                log_info(f"📊 累计: 处理{task_count}条, 成功{success_count}, 失败{fail_count}")
+            elif result == 'failed':
+                task_count += 1
+                fail_count += 1
+                log_info(f"📊 累计: 处理{task_count}条, 成功{success_count}, 失败{fail_count}")
+            else:
+                # skipped — 没有新任务
+                pass
+
+            time.sleep(task_interval)
+
+        except KeyboardInterrupt:
+            log_info("🛑 收到中断信号，正在退出...")
+            print(f"\n最终统计: 处理{task_count}条, 成功{success_count}, 失败{fail_count}")
+            break
+        except Exception as e:
+            log_error(f"💥 循环中未预期异常: {e}")
+            log_error(traceback.format_exc())
+            log_info(f"30秒后继续运行...")
+            time.sleep(30)
+
+
+if __name__ == "__main__":
+    run_forever()
