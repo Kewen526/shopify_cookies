@@ -52,6 +52,12 @@ LOG_API_BASE_URL = "http://47.104.72.198:2580"
 STORE_ID   = "893848-2"
 COOKIE_URL = "https://ceshi-1300392622.cos.ap-beijing.myqcloud.com/shopify-cookies/893848-2.json"
 
+# 库存同步配置
+INVENTORY_LOCATION_ID   = "83358875936"
+INVENTORY_LOCATION_NAME = "Shop location"  # Shopify默认库存位置名称，如不同请修改
+INVENTORY_WAIT_SECONDS  = 120              # 产品导入后等待秒数（1-2分钟）
+INVENTORY_QUANTITY      = 100              # 固定库存数量
+
 # 日志目录
 LOG_DIR = r"C:\ShopifyAutoLog"
 
@@ -1010,6 +1016,362 @@ def _trigger_shopify_import(session: requests.Session, base_headers: dict,
 
 
 # ============================================================
+# 库存同步（产品导入后设置库存数量）
+# ============================================================
+
+def generate_inventory_csv(product: ProductDetail, location_name: str,
+                            output_path: str, quantity: int = 100) -> bool:
+    """
+    生成 Shopify 库存导入 CSV。
+    格式与 Shopify 导出的库存 CSV 一致，通过 Handle + Option 值匹配变体。
+    """
+    headers = [
+        'Handle', 'Title',
+        'Option1 Name', 'Option1 Value',
+        'Option2 Name', 'Option2 Value',
+        'Option3 Name', 'Option3 Value',
+        'SKU', 'HS Code', 'COO/HS',
+        'Location', 'Incoming', 'Unavailable', 'Committed', 'Available', 'On hand'
+    ]
+
+    handle = product.handle or re.sub(r'[^a-z0-9]+', '-', product.title.lower()).strip('-')
+    option1_name = product.options[0].get('name', 'Title') if product.options else 'Title'
+    option2_name = product.options[1].get('name', '') if len(product.options) > 1 else ''
+    option3_name = product.options[2].get('name', '') if len(product.options) > 2 else ''
+
+    rows = []
+    for variant in product.variants:
+        row = {
+            'Handle': handle,
+            'Title': product.title,
+            'Option1 Name': option1_name,
+            'Option1 Value': variant.option1 or 'Default Title',
+            'Option2 Name': option2_name,
+            'Option2 Value': variant.option2 or '',
+            'Option3 Name': option3_name,
+            'Option3 Value': variant.option3 or '',
+            'SKU': variant.sku or '',
+            'HS Code': '',
+            'COO/HS': '',
+            'Location': location_name,
+            'Incoming': '0',
+            'Unavailable': '0',
+            'Committed': '0',
+            'Available': str(quantity),
+            'On hand': str(quantity),
+        }
+        rows.append(row)
+
+    try:
+        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+        log_info(f"库存CSV已生成: {output_path} ({len(rows)} 个变体, 数量={quantity})")
+        return True
+    except Exception as e:
+        log_error(f"库存CSV写入失败: {e}")
+        return False
+
+
+def sync_inventory(inventory_csv_file: str) -> bool:
+    """
+    完整的库存同步流程：
+    1. 下载Cookie + 获取CSRF Token
+    2. InventoryStagedUploads → 获取GCS上传凭证
+    3. 上传库存CSV到GCS
+    4. InventoryImportCreate → 创建导入任务
+    5. InventoryImportSubmit → 提交导入
+    6. JobPoller → 轮询等待完成
+    """
+    for attempt in range(1, 3):
+        log_info(f"📦 库存同步（第{attempt}次尝试）: {os.path.basename(inventory_csv_file)}")
+        if _do_inventory_sync(inventory_csv_file):
+            return True
+        if attempt < 2:
+            log_warning("库存同步失败，10秒后重试...")
+            time.sleep(10)
+    return False
+
+
+def _do_inventory_sync(inventory_csv_file: str) -> bool:
+    """执行库存同步的具体逻辑"""
+    cookie_list = download_cookies()
+    if not cookie_list:
+        return False
+
+    from requests.cookies import RequestsCookieJar
+    jar = RequestsCookieJar()
+    for c in cookie_list:
+        domain = c.get('domain', '')
+        path   = c.get('path', '/')
+        jar.set(c['name'], c['value'], domain=domain, path=path)
+
+    session = requests.Session()
+    session.cookies = jar
+
+    cookies_dict     = {c['name']: c['value'] for c in cookie_list}
+    session_token    = cookies_dict.get('_shopify_s', '')
+    multitrack_token = cookies_dict.get('_shopify_y', '')
+
+    file_path = Path(inventory_csv_file)
+    file_size = file_path.stat().st_size
+    filename  = file_path.name
+    log_info(f"库存文件: {filename}，大小: {file_size} bytes")
+
+    # 获取 CSRF Token
+    csrf_token = _get_csrf_token_selenium(cookie_list)
+    if not csrf_token:
+        return False
+
+    page_view_token = str(uuid.uuid4())
+
+    # 库存操作的公共 headers
+    inv_headers = {
+        'accept': 'application/json',
+        'accept-language': 'zh-CN,zh;q=0.9',
+        'apollographql-client-name': 'core',
+        'cache-control': 'no-cache,no-store,must-revalidate,max-age=0',
+        'content-type': 'application/json',
+        'origin': 'https://admin.shopify.com',
+        'referer': (f'https://admin.shopify.com/store/{STORE_ID}/products/inventory'
+                    f'?location_id={INVENTORY_LOCATION_ID}'),
+        'user-agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'),
+        'shopify-proxy-api-enable': 'true',
+        'target-manifest-route-id': 'products:inventory:list',
+        'target-pathname': '/store/:storeHandle/products/inventory',
+        'target-slice': 'inventory-section',
+        'x-csrf-token': csrf_token,
+    }
+
+    client_context = {
+        "page_view_token": page_view_token,
+        "client_route_handle": "products:inventory:list",
+        "client_pathname": f"/store/{STORE_ID}/products/inventory",
+        "client_normalized_pathname": "/store/:storeHandle/products/inventory",
+        "shopify_session_token": session_token,
+        "shopify_multitrack_token": multitrack_token
+    }
+
+    # ── 步骤1: InventoryStagedUploads ──────────────────────────
+    log_info("📤 库存步骤1: InventoryStagedUploads（获取GCS上传凭证）")
+    stage_url = (
+        f"https://admin.shopify.com/api/operations/"
+        f"dafbde9e8213fb109b67860a344cd72657293731daa8abb55ddc0245a477716c/"
+        f"InventoryStagedUploads/shopify/{STORE_ID}"
+    )
+    stage_payload = {
+        "operationName": "InventoryStagedUploads",
+        "variables": {
+            "input": [{
+                "filename": filename,
+                "mimeType": "text/csv",
+                "fileSize": str(file_size),
+                "httpMethod": "POST",
+                "resource": "INVENTORY_IMPORT"
+            }]
+        },
+        "extensions": {"client_context": client_context}
+    }
+
+    try:
+        resp = session.post(stage_url, headers=inv_headers, json=stage_payload, timeout=30)
+        if resp.status_code != 200:
+            log_error(f"InventoryStagedUploads 失败: {resp.status_code} {resp.text[:300]}")
+            return False
+
+        result = resp.json()
+        if 'errors' in result:
+            log_error(f"InventoryStagedUploads GraphQL 错误: {result['errors']}")
+            return False
+
+        staged = result['data']['stagedUploadsCreate']['stagedTargets'][0]
+        upload_url  = staged['url']
+        parameters  = staged['parameters']
+        log_info("✅ 库存GCS凭证获取成功")
+    except Exception as e:
+        log_error(f"InventoryStagedUploads 异常: {e}")
+        return False
+
+    # ── 步骤2: 上传库存CSV到GCS ────────────────────────────────
+    log_info("📤 库存步骤2: 上传CSV到Google Cloud Storage")
+    try:
+        files_data = {}
+        for param in parameters:
+            files_data[param['name']] = (None, param['value'])
+
+        with open(inventory_csv_file, 'rb') as f:
+            files_data['file'] = (filename, f, 'text/csv')
+            upload_headers = {
+                'accept': '*/*',
+                'origin': 'https://admin.shopify.com',
+                'referer': 'https://admin.shopify.com/',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            up_resp = requests.post(upload_url, headers=upload_headers,
+                                    files=files_data, timeout=60)
+
+        if up_resp.status_code in [200, 201, 204]:
+            log_info("✅ 库存CSV上传到GCS成功")
+        else:
+            log_error(f"库存GCS上传失败: {up_resp.status_code} {up_resp.text[:300]}")
+            return False
+    except Exception as e:
+        log_error(f"库存GCS上传异常: {e}")
+        return False
+
+    # 从 GCS 参数中提取 staged key
+    staged_key = None
+    for param in parameters:
+        if param.get('name') == 'key':
+            staged_key = param['value']
+            break
+
+    if not staged_key:
+        log_error("未找到库存 GCS staged key")
+        return False
+
+    # ── 步骤3: InventoryImportCreate ──────────────────────────
+    log_info(f"📥 库存步骤3: InventoryImportCreate，staged_key: {staged_key}")
+    create_url = (
+        f"https://admin.shopify.com/api/operations/"
+        f"8d2fcb60da9f65b5f03a0f9efed1ae09b64e237405a6aabab8c530247ce79a49/"
+        f"InventoryImportCreate/shopify/{STORE_ID}"
+    )
+    idempotency_key_create = str(uuid.uuid4())
+    create_payload = {
+        "operationName": "InventoryImportCreate",
+        "variables": {
+            "url": staged_key,
+            "idempotencyKey": idempotency_key_create
+        },
+        "extensions": {"client_context": client_context}
+    }
+
+    try:
+        resp = session.post(create_url, headers=inv_headers, json=create_payload, timeout=30)
+        log_info(f"InventoryImportCreate 响应: HTTP {resp.status_code}")
+
+        if resp.status_code != 200:
+            log_error(f"InventoryImportCreate 失败: {resp.status_code}")
+            return False
+
+        result = resp.json()
+        if 'errors' in result:
+            log_error(f"InventoryImportCreate GraphQL 错误: {result['errors']}")
+            return False
+
+        try:
+            import_gid = result['data']['inventoryImportCreate']['inventoryImport']['id']
+        except (KeyError, TypeError) as e:
+            log_error(f"无法提取 InventoryImport ID: {e}，响应: {json.dumps(result)[:500]}")
+            return False
+
+        log_info(f"✅ InventoryImportCreate 成功，Import ID: {import_gid}")
+
+    except Exception as e:
+        log_error(f"InventoryImportCreate 异常: {e}")
+        return False
+
+    # ── 步骤4: InventoryImportSubmit ──────────────────────────
+    log_info(f"📤 库存步骤4: InventoryImportSubmit，ID: {import_gid}")
+    submit_url = (
+        f"https://admin.shopify.com/api/operations/"
+        f"e1cbb128d9f0abd1c1b35dc85ab7ae7718944c96e5a4538b945acca1a707bd95/"
+        f"InventoryImportSubmit/shopify/{STORE_ID}"
+    )
+    idempotency_key_submit = str(uuid.uuid4())
+    submit_payload = {
+        "operationName": "InventoryImportSubmit",
+        "variables": {
+            "id": import_gid,
+            "idempotencyKey": idempotency_key_submit
+        },
+        "extensions": {"client_context": client_context}
+    }
+
+    job_id = None
+    try:
+        resp = session.post(submit_url, headers=inv_headers, json=submit_payload, timeout=30)
+        log_info(f"InventoryImportSubmit 响应: HTTP {resp.status_code}")
+
+        if resp.status_code != 200:
+            log_error(f"InventoryImportSubmit 失败: {resp.status_code}")
+            return False
+
+        result = resp.json()
+        if 'errors' in result:
+            log_error(f"InventoryImportSubmit GraphQL 错误: {result['errors']}")
+            return False
+
+        # 提取 Job ID 用于轮询
+        try:
+            job_data = result.get('data', {}).get('inventoryImportSubmit', {})
+            job_id = job_data.get('job', {}).get('id')
+        except (KeyError, TypeError, AttributeError):
+            pass
+
+        log_info("✅ InventoryImportSubmit 成功！库存导入已提交")
+
+    except Exception as e:
+        log_error(f"InventoryImportSubmit 异常: {e}")
+        return False
+
+    # ── 步骤5: JobPoller（轮询等待完成）─────────────────────────
+    if job_id:
+        log_info(f"⏳ 库存步骤5: JobPoller 轮询，Job ID: {job_id}")
+        _poll_inventory_job(session, inv_headers, job_id, csrf_token)
+    else:
+        log_info("未获取到 Job ID，跳过轮询（库存导入已提交，将在后台异步完成）")
+
+    return True
+
+
+def _poll_inventory_job(session: requests.Session, headers: dict,
+                         job_id: str, csrf_token: str,
+                         max_polls: int = 20, interval: int = 5):
+    """
+    轮询 Shopify 异步 Job 状态，直到完成或超时。
+    """
+    poller_base_url = (
+        f"https://admin.shopify.com/api/operations/"
+        f"e1593abda1eb0795fd588f8374f0f642659c1252872a4117c0ffd5e1db328980/"
+        f"JobPoller/shopify/{STORE_ID}"
+    )
+
+    variables_json = json.dumps({"id": job_id})
+    params = parse.urlencode({
+        "operationName": "JobPoller",
+        "variables": variables_json
+    })
+    poll_url = f"{poller_base_url}?{params}"
+
+    for i in range(1, max_polls + 1):
+        time.sleep(interval)
+        try:
+            resp = session.get(poll_url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                log_warning(f"JobPoller 第{i}次 HTTP {resp.status_code}")
+                continue
+
+            result = resp.json()
+            job_data = result.get('data', {}).get('job', {})
+            done = job_data.get('done', False)
+
+            if done:
+                log_info(f"✅ 库存导入 Job 已完成（第{i}次轮询）")
+                return
+            else:
+                log_info(f"⏳ 库存导入进行中... ({i}/{max_polls})")
+        except Exception as e:
+            log_warning(f"JobPoller 第{i}次异常: {e}")
+
+    log_warning(f"JobPoller 达到最大轮询次数 ({max_polls})，库存导入可能仍在后台进行")
+
+
+# ============================================================
 # 单任务处理（测试用）
 # ============================================================
 
@@ -1071,6 +1433,21 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
     upload_ok = upload_csv_to_shopify(csv_path)
 
     if upload_ok:
+        # ── 库存同步 ──────────────────────────────────────
+        log_info(f"产品导入成功，等待 {INVENTORY_WAIT_SECONDS} 秒后同步库存...")
+        time.sleep(INVENTORY_WAIT_SECONDS)
+
+        inventory_csv_path = os.path.join(csv_dir, f"inventory_{keer_product_id}.csv")
+        if generate_inventory_csv(product, INVENTORY_LOCATION_NAME, inventory_csv_path,
+                                   quantity=INVENTORY_QUANTITY):
+            inv_ok = sync_inventory(inventory_csv_path)
+            if inv_ok:
+                log_info(f"✅ 库存同步成功: {keer_product_id}")
+            else:
+                log_warning(f"⚠️ 库存同步失败（不影响产品导入状态）: {keer_product_id}")
+        else:
+            log_warning(f"⚠️ 库存CSV生成失败: {keer_product_id}")
+
         feedback_task_status(keer_product_id, 1)
         log_info(f"✅ 任务完成: {keer_product_id}")
         return 'success'
