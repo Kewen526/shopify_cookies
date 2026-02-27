@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Shopify CSV 自动生成 + 上传 + 日志统计
-功能：24小时无限循环，每3分钟处理一个产品
-日志目录：C:\ShopifyAutoLog\
+Shopify CSV 自动生成 + 上传（单任务测试版，供 PyCharm 本地调试使用）
+只获取并处理一条任务后退出。
 """
 
 import csv
@@ -47,18 +46,14 @@ DB_CONFIG = {
 
 # API基础地址
 API_BASE_URL     = "http://47.95.157.46:8520"
-LOG_API_BASE_URL = "http://47.104.72.198:2580"   # 日志 & Cookie 状态 API
+LOG_API_BASE_URL = "http://47.104.72.198:2580"
 
 # Shopify配置
-STORE_ID = "893848-2"
+STORE_ID   = "893848-2"
 COOKIE_URL = "https://ceshi-1300392622.cos.ap-beijing.myqcloud.com/shopify-cookies/893848-2.json"
 
 # 日志目录
 LOG_DIR = r"C:\ShopifyAutoLog"
-
-# 执行间隔（秒）
-TASK_INTERVAL_SECONDS = 180   # 每3分钟一个产品
-NO_TASK_WAIT_SECONDS  = 30    # 无任务时等待30秒
 
 
 # ============================================================
@@ -88,23 +83,15 @@ def _today_log_path() -> str:
     return os.path.join(LOG_DIR, f"shopify_{date_str}.log")
 
 def write_daily_log(keer_product_id: str, result: str, detail: str = ""):
-    """
-    向当天日志文件追加一条记录，并同步写入数据库
-    result: 'success' / 'failed' / 'skipped'
-    """
-    # 写本地文件（原有逻辑保留）
     log_path = _today_log_path()
     now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{now_str}] [{result.upper():8s}] ID={str(keer_product_id or '-'):30s} {detail}\n"
     with open(log_path, 'a', encoding='utf-8') as f:
         f.write(line)
-
-    # 同步写入数据库
     _write_db_log(keer_product_id, result, detail)
 
 
 def _write_db_log(keer_product_id: str, result: str, detail: str = ""):
-    """将任务执行结果写入 shopify_task_log 表"""
     try:
         conn = pymysql.connect(**DB_CONFIG)
         try:
@@ -127,41 +114,6 @@ def _write_db_log(keer_product_id: str, result: str, detail: str = ""):
             conn.close()
     except Exception as e:
         log_error(f"DB日志写入失败（不影响主流程）: {e}")
-
-def write_daily_summary():
-    """
-    在日志文件末尾追加当天的汇总统计（每次循环都更新末尾汇总行）
-    改为每次任务结束后调用，统计当天文件内容。
-    """
-    log_path = _today_log_path()
-    if not os.path.exists(log_path):
-        return
-
-    total = success = failed = skipped = 0
-    lines = []
-    with open(log_path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-
-    # 过滤掉旧的汇总行，重新统计
-    data_lines = [l for l in lines if not l.startswith('===')]
-    for line in data_lines:
-        if '[SUCCESS' in line:
-            total += 1; success += 1
-        elif '[FAILED' in line:
-            total += 1; failed += 1
-        elif '[SKIPPED' in line:
-            skipped += 1
-
-    summary = (
-        f"{'=' * 70}\n"
-        f"  当日汇总 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 更新)\n"
-        f"  执行任务: {total}  成功: {success}  失败: {failed}  跳过(无任务): {skipped}\n"
-        f"{'=' * 70}\n"
-    )
-
-    with open(log_path, 'w', encoding='utf-8') as f:
-        f.writelines(data_lines)
-        f.write(summary)
 
 
 # ============================================================
@@ -652,7 +604,6 @@ def generate_shopify_csv(product: ProductDetail, price: float, category: str,
 # ============================================================
 
 def _report_cookie_status_worker(is_valid: bool, detail: str):
-    """后台线程：执行上报，失败静默处理"""
     try:
         url = f"{LOG_API_BASE_URL}/api/shopify/cookie-status/report"
         payload = {
@@ -672,20 +623,15 @@ def _report_cookie_status_worker(is_valid: bool, detail: str):
 
 
 def report_cookie_status(is_valid: bool, detail: str = ""):
-    """
-    向 API 服务上报当前 Cookie 有效性。
-    后台线程发送，不阻塞主流程。
-    """
     t = threading.Thread(target=_report_cookie_status_worker, args=(is_valid, detail), daemon=True)
     t.start()
 
 
 # ============================================================
-# Cookie下载（从腾讯云COS）
+# Cookie下载
 # ============================================================
 
 def download_cookies() -> Optional[list]:
-    """从COS下载Cookie JSON，返回完整cookie列表（含domain/path信息）"""
     try:
         log_info(f"正在下载Cookie: {COOKIE_URL}")
         resp = requests.get(COOKIE_URL, timeout=15)
@@ -714,11 +660,6 @@ def download_cookies() -> Optional[list]:
 # ============================================================
 
 def _get_csrf_token_selenium(cookie_list: list) -> Optional[str]:
-    """
-    使用 Selenium（真实 Chrome）获取 CSRF Token。
-    requests 直接访问会被 Shopify Bot 检测返回 403；
-    Selenium 携带完整浏览器指纹，可绕过检测。
-    """
     url = f"https://admin.shopify.com/store/{STORE_ID}/products?selectedView=all"
     driver = None
     try:
@@ -733,7 +674,6 @@ def _get_csrf_token_selenium(cookie_list: list) -> Optional[str]:
             '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
             '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
         )
-        # 隐藏自动化特征
         chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
         chrome_options.add_experimental_option('useAutomationExtension', False)
 
@@ -742,12 +682,10 @@ def _get_csrf_token_selenium(cookie_list: list) -> Optional[str]:
             'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         })
 
-        # Selenium 注入 cookie 前必须先打开同域页面
         log_info("🌐 Selenium 正在加载 Shopify 后台...")
         driver.get("https://admin.shopify.com/")
         time.sleep(1)
 
-        # 注入 cookie
         for c in cookie_list:
             cookie_entry = {
                 'name':   c['name'],
@@ -762,15 +700,12 @@ def _get_csrf_token_selenium(cookie_list: list) -> Optional[str]:
             try:
                 driver.add_cookie(cookie_entry)
             except Exception:
-                pass  # 跳过个别不兼容的 cookie
+                pass
 
-        # 访问目标页面
         driver.get(url)
-        # 等待页面加载
         time.sleep(5)
 
         content = driver.page_source
-
         pattern = r'<script type="text/json" data-serialized-id="server-data">\s*(\{.*?\})\s*</script>'
         match = re.search(pattern, content, re.DOTALL)
         if not match:
@@ -806,10 +741,7 @@ def _get_csrf_token_selenium(cookie_list: list) -> Optional[str]:
 
 
 def upload_csv_to_shopify(csv_file: str) -> bool:
-    """
-    将CSV上传到Shopify后台（失败自动重试1次）
-    """
-    for attempt in range(1, 3):  # 最多2次（原始 + 重试1次）
+    for attempt in range(1, 3):
         log_info(f"📤 上传CSV（第{attempt}次尝试）: {os.path.basename(csv_file)}")
         if _do_upload(csv_file):
             return True
@@ -820,8 +752,6 @@ def upload_csv_to_shopify(csv_file: str) -> bool:
 
 
 def _do_upload(csv_file: str) -> bool:
-    """执行一次上传"""
-    # 1. 下载Cookie
     cookie_list = download_cookies()
     if not cookie_list:
         return False
@@ -840,18 +770,15 @@ def _do_upload(csv_file: str) -> bool:
     session_token    = cookies_dict.get('_shopify_s', '')
     multitrack_token = cookies_dict.get('_shopify_y', '')
 
-    # 2. 获取文件信息
     file_path = Path(csv_file)
     file_size = file_path.stat().st_size
     filename  = file_path.name
     log_info(f"文件: {filename}，大小: {file_size} bytes")
 
-    # 3. 获取CSRF Token（Selenium 真实浏览器，绕过 Shopify Bot 检测）
     csrf_token = _get_csrf_token_selenium(cookie_list)
     if not csrf_token:
         return False
 
-    # 4. 获取上传凭证
     log_info("获取GCS上传凭证...")
     api_url = (f"https://admin.shopify.com/api/operations/"
                f"a2199f150c46ccdff0a4ea14b2362f7b6c06412eee6d360d8f0e128486e39cf4/"
@@ -918,7 +845,6 @@ def _do_upload(csv_file: str) -> bool:
         log_error(f"获取凭证异常: {e}")
         return False
 
-    # 5. 上传到GCS
     log_info("上传文件到Google Cloud Storage...")
     try:
         files_data = {}
@@ -938,7 +864,6 @@ def _do_upload(csv_file: str) -> bool:
 
         if up_resp.status_code in [200, 201, 204]:
             log_info("✅ CSV上传到GCS成功！")
-            return True
         else:
             log_error(f"GCS上传失败: {up_resp.status_code} {up_resp.text[:300]}")
             return False
@@ -946,9 +871,146 @@ def _do_upload(csv_file: str) -> bool:
         log_error(f"GCS上传异常: {e}")
         return False
 
+    # 步骤3 + 步骤4：触发 Shopify 真正导入
+    return _trigger_shopify_import(session, req_headers, parameters,
+                                   session_token, multitrack_token, page_view_token)
+
+
+def _trigger_shopify_import(session: requests.Session, base_headers: dict,
+                             gcs_parameters: list,
+                             session_token: str, multitrack_token: str,
+                             page_view_token: str) -> bool:
+    """
+    完整的 Shopify 导入流程（抓包确认的真实接口）：
+      步骤3: ProductImportCreate  → 用 GCS key 创建导入任务，返回 ProductImport ID
+      步骤4: ProductImportSubmit  → 用 ID 提交执行，产品才会真正出现在后台
+    """
+
+    # 从 GCS 参数里提取 key（格式如 tmp/xxxxx/filename.csv）
+    staged_key = None
+    for param in gcs_parameters:
+        if param.get('name') == 'key':
+            staged_key = param['value']
+            break
+
+    if not staged_key:
+        log_error("❌ 未找到 GCS staged key，无法触发导入")
+        return False
+
+    log_info(f"📥 步骤3: ProductImportCreate，staged_key: {staged_key}")
+
+    # ── 公共 headers ──────────────────────────────────────────
+    common_headers = {
+        'accept': 'application/json',
+        'accept-language': 'zh-CN,zh;q=0.9',
+        'apollographql-client-name': 'core',
+        'cache-control': 'no-cache,no-store,must-revalidate,max-age=0',
+        'content-type': 'application/json',
+        'origin': 'https://admin.shopify.com',
+        'referer': f'https://admin.shopify.com/store/{STORE_ID}/products?selectedView=all',
+        'user-agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'),
+        'shopify-proxy-api-enable': 'true',
+        'target-manifest-route-id': 'products:list',
+        'target-pathname': '/store/:storeHandle/products',
+        'target-slice': 'products-section',
+        'x-csrf-token': base_headers.get('x-csrf-token', ''),
+    }
+
+    client_context = {
+        "page_view_token": page_view_token,
+        "client_route_handle": "products:list",
+        "client_pathname": f"/store/{STORE_ID}/products",
+        "client_normalized_pathname": "/store/:storeHandle/products",
+        "shopify_session_token": session_token,
+        "shopify_multitrack_token": multitrack_token
+    }
+
+    # ── 步骤3: ProductImportCreate ────────────────────────────
+    create_url = (
+        f"https://admin.shopify.com/api/operations/"
+        f"68c029f983cbd39de99c30c73518a1f84a1053e06c5b312ed4d994967dc36a3f/"
+        f"ProductImportCreate/shopify/{STORE_ID}"
+    )
+    create_payload = {
+        "operationName": "ProductImportCreate",
+        "variables": {
+            "input": {
+                "url": staged_key,
+                "overwrite": True,
+                "publishToAllChannels": True
+            }
+        },
+        "extensions": {"client_context": client_context}
+    }
+
+    try:
+        resp = session.post(create_url, headers=common_headers, json=create_payload, timeout=30)
+        log_info(f"ProductImportCreate 响应: HTTP {resp.status_code}")
+        log_info(f"响应内容: {resp.text[:500]}")
+
+        if resp.status_code != 200:
+            log_error(f"ProductImportCreate 失败: {resp.status_code}")
+            return False
+
+        result = resp.json()
+        if 'errors' in result:
+            log_error(f"ProductImportCreate GraphQL 错误: {result['errors']}")
+            return False
+
+        # 提取 ProductImport GID，格式: gid://shopify/ProductImport/xxxxxxxx
+        try:
+            import_gid = result['data']['productImportCreate']['productImport']['id']
+        except (KeyError, TypeError) as e:
+            log_error(f"无法从响应中提取 ProductImport ID: {e}，响应: {result}")
+            return False
+
+        log_info(f"✅ ProductImportCreate 成功，Import ID: {import_gid}")
+
+    except Exception as e:
+        log_error(f"ProductImportCreate 异常: {e}")
+        return False
+
+    # ── 步骤4: ProductImportSubmit ────────────────────────────
+    log_info(f"📤 步骤4: ProductImportSubmit，ID: {import_gid}")
+
+    submit_url = (
+        f"https://admin.shopify.com/api/operations/"
+        f"0623f4c83b0e6dfe94448cebe8295bb1ae5c3b6406ed1e9acec2d69571d477a4/"
+        f"ProductImportSubmit/shopify/{STORE_ID}"
+    )
+    submit_payload = {
+        "operationName": "ProductImportSubmit",
+        "variables": {
+            "id": import_gid
+        },
+        "extensions": {"client_context": client_context}
+    }
+
+    try:
+        resp = session.post(submit_url, headers=common_headers, json=submit_payload, timeout=30)
+        log_info(f"ProductImportSubmit 响应: HTTP {resp.status_code}")
+        log_info(f"响应内容: {resp.text[:500]}")
+
+        if resp.status_code != 200:
+            log_error(f"ProductImportSubmit 失败: {resp.status_code}")
+            return False
+
+        result = resp.json()
+        if 'errors' in result:
+            log_error(f"ProductImportSubmit GraphQL 错误: {result['errors']}")
+            return False
+
+        log_info("✅ ProductImportSubmit 成功！产品将在 Shopify 后台异步导入（通常1~2分钟内完成）")
+        return True
+
+    except Exception as e:
+        log_error(f"ProductImportSubmit 异常: {e}")
+        return False
+
 
 # ============================================================
-# 主循环
+# 单任务处理（测试用）
 # ============================================================
 
 def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
@@ -956,13 +1018,12 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
     处理单条任务
     返回值: 'success' / 'failed' / 'skipped'
     """
-    # 1. 获取任务
     task = fetch_one_task()
     if not task:
-        log_info("暂无待处理任务，等待下一轮...")
+        log_info("暂无待处理任务，退出。")
         return 'skipped'
 
-    keer_product_id  = task.get('keer_product_id')
+    keer_product_id      = task.get('keer_product_id')
     client_product_url   = task.get('client_product_url')
     client_product_image = task.get('client_product_image')
     quotation_result     = task.get('quotation_result')
@@ -970,7 +1031,7 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
     log_info(f"--- 开始处理任务: {keer_product_id} ---")
     log_info(f"商品URL: {client_product_url}")
 
-    # 2. 解析价格（原始为欧元，×1.2 转为美元）
+    # 解析价格（原始为欧元，×1.2 转为美元）
     price = parse_price_from_quotation(quotation_result)
     if price is None:
         log_warning("价格解析失败，使用默认价格 0.0")
@@ -979,7 +1040,7 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
     price = round(price * 1.2, 2)
     log_info(f"解析价格: €{price_eur} → ${price}（×1.2 EUR→USD）")
 
-    # 3. 抓取商品
+    # 抓取商品
     scraper = ShopifyScraper()
     product = scraper.fetch(client_product_url)
     if not product:
@@ -989,14 +1050,14 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
 
     log_info(f"商品标题: {product.title} | 变体: {len(product.variants)} | 图片: {len(product.images)}")
 
-    # 4. AI分类
+    # AI分类
     category = None
     if client_product_image:
         log_info("正在识别商品分类...")
         category = get_product_category(analyzer, client_product_image)
     log_info(f"商品分类: {category or '未设置'}")
 
-    # 5. 生成CSV（保存到C:\ShopifyAutoLog\csv\）
+    # 生成CSV
     csv_dir = os.path.join(LOG_DIR, 'csv')
     os.makedirs(csv_dir, exist_ok=True)
     csv_path = os.path.join(csv_dir, f"shopify_import_{keer_product_id}.csv")
@@ -1006,7 +1067,7 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
         feedback_task_status(keer_product_id, 2)
         return 'failed'
 
-    # 6. 上传CSV
+    # 上传CSV
     upload_ok = upload_csv_to_shopify(csv_path)
 
     if upload_ok:
@@ -1019,75 +1080,22 @@ def process_one_task(analyzer: ZhipuImageAnalyzer) -> str:
         return 'failed'
 
 
-def main_loop():
-    """24小时无限循环主入口"""
-    print("\n" + "=" * 60)
-    print("🚀 Shopify 自动化工具 — 无限循环模式")
-    print(f"   每 {TASK_INTERVAL_SECONDS // 60} 分钟处理一个产品")
-    print(f"   日志目录: {LOG_DIR}")
-    print("=" * 60 + "\n")
-
-    _ensure_log_dir()
-    analyzer = ZhipuImageAnalyzer()
-    init_global_api_keys()
-
-    while True:
-        loop_start = time.time()
-        keer_product_id = None
-
-        try:
-            # 先偷看一下任务ID，用于日志
-            task_preview = fetch_one_task()
-            keer_product_id = task_preview.get('keer_product_id') if task_preview else None
-
-            result = process_one_task(analyzer)
-
-            if result == 'skipped':
-                write_daily_log('-', 'skipped', '无待处理任务')
-                write_daily_summary()
-                log_info(f"等待 {NO_TASK_WAIT_SECONDS} 秒后重试...")
-                time.sleep(NO_TASK_WAIT_SECONDS)
-                continue  # 跳过3分钟等待，直接再轮询
-
-            elif result == 'success':
-                write_daily_log(keer_product_id or '-', 'success', '生成+上传均成功')
-
-            elif result == 'failed':
-                write_daily_log(keer_product_id or '-', 'failed', '生成或上传失败')
-
-            write_daily_summary()
-
-        except Exception as e:
-            log_error(f"🔴 主循环异常（不中断程序）: {e}")
-            import traceback
-            traceback.print_exc()
-            write_daily_log(keer_product_id or '-', 'failed', f'主循环异常: {str(e)[:100]}')
-            write_daily_summary()
-
-        # 等待至满3分钟
-        elapsed = time.time() - loop_start
-        remaining = TASK_INTERVAL_SECONDS - elapsed
-        if remaining > 0:
-            log_info(f"⏱️ 本次耗时 {elapsed:.1f}s，等待 {remaining:.1f}s 后处理下一个...")
-            time.sleep(remaining)
-
-
 # ============================================================
-# 影刀 RPA 入口（供影刀直接调用）
-# ============================================================
-
-def shopify_run(args=None):
-    """
-    影刀 RPA 统一入口函数。
-    在影刀中配置「执行Python函数」，函数名填 shopify_run，即可全自动运行。
-    args 参数由影刀平台传入，可忽略。
-    """
-    main_loop()
-
-
-# ============================================================
-# 程序入口
+# 程序入口（单任务测试模式）
 # ============================================================
 
 if __name__ == "__main__":
-    main_loop()
+    print("=" * 60)
+    print("🧪 Shopify 单任务测试模式（只处理一条任务后退出）")
+    print(f"   日志目录: {LOG_DIR}")
+    print("=" * 60)
+
+    _ensure_log_dir()
+    init_global_api_keys()
+    analyzer = ZhipuImageAnalyzer()
+
+    result = process_one_task(analyzer)
+
+    print("\n" + "=" * 60)
+    print(f"🏁 执行结果: {result.upper()}")
+    print("=" * 60)
