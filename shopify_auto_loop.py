@@ -54,7 +54,7 @@ COOKIE_URL = "https://ceshi-1300392622.cos.ap-beijing.myqcloud.com/shopify-cooki
 
 # 库存同步配置
 INVENTORY_LOCATION_ID   = "83358875936"
-INVENTORY_LOCATION_NAME = "Shop location"  # Shopify默认库存位置名称，如不同请修改
+INVENTORY_LOCATION_NAME = "牟平区北关大街845"
 INVENTORY_WAIT_SECONDS  = 120              # 产品导入后等待秒数（1-2分钟）
 INVENTORY_QUANTITY      = 100              # 固定库存数量
 
@@ -1031,7 +1031,7 @@ def generate_inventory_csv(product: ProductDetail, location_name: str,
         'Option2 Name', 'Option2 Value',
         'Option3 Name', 'Option3 Value',
         'SKU', 'HS Code', 'COO/HS',
-        'Location', 'Incoming', 'Unavailable', 'Committed', 'Available', 'On hand'
+        'Location', 'Bin name', 'Incoming', 'Unavailable', 'Committed', 'Available', 'On hand'
     ]
 
     handle = product.handle or re.sub(r'[^a-z0-9]+', '-', product.title.lower()).strip('-')
@@ -1054,6 +1054,7 @@ def generate_inventory_csv(product: ProductDetail, location_name: str,
             'HS Code': '',
             'COO/HS': '',
             'Location': location_name,
+            'Bin name': '',
             'Incoming': '0',
             'Unavailable': '0',
             'Committed': '0',
