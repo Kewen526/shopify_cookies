@@ -55,6 +55,7 @@ COOKIE_URL = "https://ceshi-1300392622.cos.ap-beijing.myqcloud.com/shopify-cooki
 # 库存同步配置
 INVENTORY_LOCATION_ID   = "83358875936"
 INVENTORY_LOCATION_NAME = "牟平区北关大街845"
+AUTODS_LOCATION_NAME    = "AutoDS prod-pfhikdgf"   # AutoDS 仓库位置（固定）
 INVENTORY_WAIT_SECONDS  = 120              # 产品导入后等待秒数（1-2分钟）
 INVENTORY_QUANTITY      = 100              # 固定库存数量
 
@@ -1023,15 +1024,20 @@ def generate_inventory_csv(product: ProductDetail, location_name: str,
                             output_path: str, quantity: int = 100) -> bool:
     """
     生成 Shopify 库存导入 CSV。
-    格式与 Shopify 导出的库存 CSV 一致，通过 Handle + Option 值匹配变体。
+    格式与 Shopify 导出的库存 CSV 完全一致：
+    - 每个变体两行：牟平区北关大街845 行 + AutoDS 行
+    - 使用 "On hand (current)" 和 "On hand (new)" 列
     """
     headers = [
         'Handle', 'Title',
         'Option1 Name', 'Option1 Value',
         'Option2 Name', 'Option2 Value',
         'Option3 Name', 'Option3 Value',
-        'SKU', 'HS Code', 'COO/HS',
-        'Location', 'Bin name', 'Incoming', 'Unavailable', 'Committed', 'Available', 'On hand'
+        'SKU', 'HS Code', 'COO',
+        'Location', 'Bin name',
+        'Incoming (not editable)', 'Unavailable (not editable)',
+        'Committed (not editable)', 'Available (not editable)',
+        'On hand (current)', 'On hand (new)'
     ]
 
     handle = product.handle or re.sub(r'[^a-z0-9]+', '-', product.title.lower()).strip('-')
@@ -1041,7 +1047,7 @@ def generate_inventory_csv(product: ProductDetail, location_name: str,
 
     rows = []
     for variant in product.variants:
-        row = {
+        common = {
             'Handle': handle,
             'Title': product.title,
             'Option1 Name': option1_name,
@@ -1052,16 +1058,34 @@ def generate_inventory_csv(product: ProductDetail, location_name: str,
             'Option3 Value': variant.option3 or '',
             'SKU': variant.sku or '',
             'HS Code': '',
-            'COO/HS': '',
+            'COO': '',
+        }
+        # 主仓库行：设置库存数量
+        main_row = {
+            **common,
             'Location': location_name,
             'Bin name': '',
-            'Incoming': '0',
-            'Unavailable': '0',
-            'Committed': '0',
-            'Available': str(quantity),
-            'On hand': str(quantity),
+            'Incoming (not editable)': '0',
+            'Unavailable (not editable)': '0',
+            'Committed (not editable)': '0',
+            'Available (not editable)': '0',
+            'On hand (current)': '0',
+            'On hand (new)': str(quantity),
         }
-        rows.append(row)
+        rows.append(main_row)
+        # AutoDS 行：not stocked
+        autods_row = {
+            **common,
+            'Location': AUTODS_LOCATION_NAME,
+            'Bin name': '',
+            'Incoming (not editable)': 'not stocked',
+            'Unavailable (not editable)': 'not stocked',
+            'Committed (not editable)': 'not stocked',
+            'Available (not editable)': 'not stocked',
+            'On hand (current)': 'not stocked',
+            'On hand (new)': '',
+        }
+        rows.append(autods_row)
 
     try:
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
@@ -1069,7 +1093,7 @@ def generate_inventory_csv(product: ProductDetail, location_name: str,
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             writer.writerows(rows)
-        log_info(f"库存CSV已生成: {output_path} ({len(rows)} 个变体, 数量={quantity})")
+        log_info(f"库存CSV已生成: {output_path} ({len(product.variants)} 个变体, 数量={quantity})")
         return True
     except Exception as e:
         log_error(f"库存CSV写入失败: {e}")
